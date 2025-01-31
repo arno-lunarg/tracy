@@ -58,7 +58,7 @@ namespace tracy
     Operation(vkGetQueryPoolResults) \
     Operation(vkQueueSubmit) \
     Operation(vkQueueWaitIdle) \
-    Operation(vkResetQueryPool)
+    Operation(vkResetQueryPoolEXT)
 
 #define LoadVkDeviceExtensionSymbols(Operation) \
     Operation(vkGetCalibratedTimestampsEXT)
@@ -89,6 +89,7 @@ struct VkSymbolTable
 class VkCtx
 {
     friend class VkCtxScope;
+    friend class VkCtxManualScope;
 
     enum { QueryCount = 64 * 1024 };
 
@@ -181,7 +182,7 @@ public:
 #if defined TRACY_VK_USE_SYMBOL_TABLE
     VkCtx( VkInstance instance, VkPhysicalDevice physdev, VkDevice device, PFN_vkGetInstanceProcAddr instanceProcAddr, PFN_vkGetDeviceProcAddr deviceProcAddr )
 #else
-    VkCtx( VkPhysicalDevice physdev, VkDevice device, PFN_vkResetQueryPoolEXT vkResetQueryPool, PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT vkGetPhysicalDeviceCalibrateableTimeDomainsEXT, PFN_vkGetCalibratedTimestampsEXT vkGetCalibratedTimestampsEXT )
+    VkCtx( VkPhysicalDevice physdev, VkDevice device, PFN_vkResetQueryPoolEXT vkResetQueryPoolEXT, PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT vkGetPhysicalDeviceCalibrateableTimeDomainsEXT, PFN_vkGetCalibratedTimestampsEXT vkGetCalibratedTimestampsEXT )
 #endif
         : m_device( device )
         , m_timeDomain( VK_TIME_DOMAIN_DEVICE_EXT )
@@ -201,7 +202,7 @@ public:
         m_vkGetCalibratedTimestampsEXT = m_symbols.vkGetCalibratedTimestampsEXT;
 #endif
 
-        assert( VK_FUNCTION_WRAPPER( vkResetQueryPool ) != nullptr );
+        assert( VK_FUNCTION_WRAPPER( vkResetQueryPoolEXT ) != nullptr );
         assert( VK_FUNCTION_WRAPPER( vkGetPhysicalDeviceCalibrateableTimeDomainsEXT ) != nullptr );
         assert( VK_FUNCTION_WRAPPER( vkGetCalibratedTimestampsEXT ) != nullptr );
 
@@ -214,7 +215,7 @@ public:
         int64_t tcpu = Profiler::GetTime();
 
         CreateQueryPool();
-        VK_FUNCTION_WRAPPER( vkResetQueryPool( device, m_query, 0, m_queryCount ) );
+        VK_FUNCTION_WRAPPER( vkResetQueryPoolEXT( device, m_query, 0, m_queryCount ) );
 
         WriteInitialItem( physdev, tcpu, tgpu );
 
@@ -625,6 +626,55 @@ private:
     const bool m_active;
 
     VkCommandBuffer m_cmdbuf;
+    VkCtx* m_ctx;
+};
+
+class VkCtxManualScope
+{
+public:
+    tracy_force_inline VkCtxManualScope( VkCtx* ctx, const SourceLocationData* srcloc, VkCommandBuffer cmdbuf, bool is_active )
+        #ifdef TRACY_ON_DEMAND
+        : m_active( is_active && GetProfiler().IsConnected() )
+        #else
+        : m_active( is_active )
+        #endif
+    {
+        if( !m_active ) return;
+        m_ctx = ctx;
+
+        const auto queryId = ctx->NextQueryId();
+        CONTEXT_VK_FUNCTION_WRAPPER( vkCmdWriteTimestamp( cmdbuf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx->m_query, queryId ) );
+
+        auto item = Profiler::QueueSerial();
+        MemWrite( &item->hdr.type, QueueType::GpuZoneBeginSerial );
+        MemWrite( &item->gpuZoneBegin.cpuTime, Profiler::GetTime() );
+        MemWrite( &item->gpuZoneBegin.srcloc, (uint64_t)srcloc );
+        MemWrite( &item->gpuZoneBegin.thread, GetThreadHandle() );
+        MemWrite( &item->gpuZoneBegin.queryId, uint16_t( queryId ) );
+        MemWrite( &item->gpuZoneBegin.context, ctx->GetId() );
+        Profiler::QueueSerialFinish();
+    }
+
+    tracy_force_inline void CloseScope(VkCommandBuffer cmdBuf)
+    {
+        if( !m_active ) return;
+
+        const auto queryId = m_ctx->NextQueryId();
+        CONTEXT_VK_FUNCTION_WRAPPER( vkCmdWriteTimestamp( cmdBuf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_ctx->m_query, queryId ) );
+
+        auto item = Profiler::QueueSerial();
+        MemWrite( &item->hdr.type, QueueType::GpuZoneEndSerial );
+        MemWrite( &item->gpuZoneEnd.cpuTime, Profiler::GetTime() );
+        MemWrite( &item->gpuZoneEnd.thread, GetThreadHandle() );
+        MemWrite( &item->gpuZoneEnd.queryId, uint16_t( queryId ) );
+        MemWrite( &item->gpuZoneEnd.context, m_ctx->GetId() );
+        Profiler::QueueSerialFinish();
+
+        m_active = false;
+    }
+
+private:
+    bool m_active;
     VkCtx* m_ctx;
 };
 
